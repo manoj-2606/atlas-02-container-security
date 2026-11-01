@@ -30,5 +30,5 @@ venv/
 
 # Scan reports (generated, not committed)
 *.sarif
-sbom.json
-trivy-report.*
+trivy-report.txt
+trivy-report.json

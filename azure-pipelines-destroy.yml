@@ -19,7 +19,15 @@ stages:
               steps:
                 - checkout: self
 
-                # --- Step 1: Terraform destroy (needs state, so runs BEFORE backend deletion) ---
+                # --- Install Terraform ---
+                - script: |
+                    curl -sLo terraform.zip \
+                      https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
+                    sudo unzip -o terraform.zip -d /usr/local/bin
+                    terraform version
+                  displayName: "Install Terraform"
+
+                # --- Step 1: Terraform destroy ---
                 - task: AzureCLI@2
                   displayName: 'Terraform Destroy'
                   inputs:
@@ -32,6 +40,7 @@ stages:
                       set -euo pipefail
                       export ARM_USE_OIDC=true
                       export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_OIDC_TOKEN=$idToken
                       export ARM_TENANT_ID=$tenantId
                       export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
