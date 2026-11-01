@@ -127,15 +127,9 @@ stages:
                 echo "##vso[task.setvariable variable=acrLogin;isOutput=true]$ACR_LOGIN"
 
           # --- Docker Build (multi-stage) ---
-          - task: Docker@2
+          - script: |
+              docker build -t "$(imageName):$(imageTag)" -t "$(imageName):latest" -f Dockerfile .
             displayName: 'Docker Build (multi-stage, non-root)'
-            inputs:
-              command: 'build'
-              Dockerfile: 'Dockerfile'
-              buildContext: '.'
-              tags: |
-                $(imageName):$(imageTag)
-                $(imageName):latest
 
           # --- Trivy CVE Scan (gate: fail on CRITICAL) ---
           - script: |
