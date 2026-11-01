@@ -54,7 +54,12 @@ stages:
             deploy:
               steps:
                 - checkout: self
-
+                - script: |
+                    curl -fsSL https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip -o tf.zip
+                    unzip tf.zip && sudo mv terraform /usr/local/bin/
+                    terraform version
+                  displayName: 'Install Terraform'
+                  
                 - task: AzureCLI@2
                   displayName: 'Terraform Init'
                   inputs:
