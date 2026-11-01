@@ -9,14 +9,29 @@ mkdir -p "$REPORT_DIR"
 # --- Install Trivy (pinned version for reproducibility) ---
 TRIVY_VERSION="0.57.1"
 echo "=== Installing Trivy v${TRIVY_VERSION} ==="
+
+# Try direct download first
 for i in 1 2 3; do
-  curl -sfL -o trivy.tar.gz \
+  curl -sfL --retry 3 --retry-delay 5 -o trivy.tar.gz \
     "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz" \
     && break
   echo "Retry $i..."
-  sleep 5
+  sleep 10
 done
-tar -xzf trivy.tar.gz -C /usr/local/bin trivy
+
+# Fallback: install via apt if download failed
+if [ ! -f trivy.tar.gz ]; then
+  echo "=== Direct download failed, installing via apt ==="
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq wget apt-transport-https gnupg
+  wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+  echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq trivy
+else
+  tar -xzf trivy.tar.gz -C /usr/local/bin trivy
+fi
+
 trivy --version
 
 # --- Generate table report (human-readable) ---
