@@ -53,10 +53,10 @@ stages:
                 - checkout: self
                 - script: |
                     curl -sLo terraform.zip \
-                      https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip
+                      https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
                     unzip -o terraform.zip -d /usr/local/bin
                     terraform version
-                  displayName: "Install Terraform $(terraformVersion)"
+                  displayName: "Install Terraform"
 
                 - task: AzureCLI@2
                   displayName: 'Terraform Init'
