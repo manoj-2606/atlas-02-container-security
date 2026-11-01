@@ -1,0 +1,199 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: atlas-02-vars
+  - name: imageName
+    value: 'atlas-platform-app'
+  - name: imageTag
+    value: '$(Build.BuildId)'
+  - name: resourceGroup
+    value: 'rg-atlas-02-dev'
+
+# ==============================================================================
+# Stage 1: Bootstrap — Create backend storage (idempotent)
+# ==============================================================================
+stages:
+  - stage: Bootstrap
+    displayName: 'Bootstrap — Backend Storage'
+    jobs:
+      - job: CreateBackend
+        displayName: 'Create TF State Backend'
+        steps:
+          - task: AzureCLI@2
+            displayName: 'Ensure storage account exists'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              addSpnToEnvironment: true
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -euo pipefail
+                az group create --name "$(backendResourceGroup)" --location "$(location)" --output none
+                az storage account create --name "$(backendStorageAccount)" --resource-group "$(backendResourceGroup)" --location "$(location)" --sku Standard_LRS --kind StorageV2 --output none 2>/dev/null || true
+                az storage container create --name "$(backendContainer)" --account-name "$(backendStorageAccount)" --auth-mode login --output none 2>/dev/null || true
+                echo "=== Backend ready ==="
+
+  # ==============================================================================
+  # Stage 2: Infra — Terraform provisions RG + ACR
+  # ==============================================================================
+  - stage: Infra
+    displayName: 'Infra — Provision ACR'
+    dependsOn: Bootstrap
+    jobs:
+      - deployment: DeployInfra
+        displayName: 'Terraform Apply'
+        environment: 'atlas-02-deploy'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init'
+                  inputs:
+                    azureSubscription: '$(serviceConnection)'
+                    scriptType: 'bash'
+                    addSpnToEnvironment: true
+                    workingDirectory: 'terraform'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_USE_OIDC=true
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      terraform init \
+                        -backend-config="resource_group_name=$(backendResourceGroup)" \
+                        -backend-config="storage_account_name=$(backendStorageAccount)" \
+                        -backend-config="container_name=$(backendContainer)" \
+                        -backend-config="key=$(backendKey)"
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Plan + Apply'
+                  inputs:
+                    azureSubscription: '$(serviceConnection)'
+                    scriptType: 'bash'
+                    addSpnToEnvironment: true
+                    workingDirectory: 'terraform'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_USE_OIDC=true
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+                      terraform plan -var-file="environments/dev.tfvars" -out=tfplan
+                      terraform apply -auto-approve tfplan
+
+  # ==============================================================================
+  # Stage 3: Container Security — Build, Scan, SBOM, Push, Verify
+  # ==============================================================================
+  - stage: Container_Security
+    displayName: 'Container — Build → Scan → Push'
+    dependsOn: Infra
+    jobs:
+      - job: BuildScanPush
+        displayName: 'Docker Build → Trivy Scan → SBOM → ACR Push'
+        steps:
+          - checkout: self
+
+          # --- Discover ACR from deployed infra ---
+          - task: AzureCLI@2
+            name: GetACR
+            displayName: 'Discover ACR details'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              addSpnToEnvironment: true
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -euo pipefail
+                ACR_NAME=$(az acr list --resource-group "$(resourceGroup)" --query "[0].name" -o tsv)
+                ACR_LOGIN=$(az acr list --resource-group "$(resourceGroup)" --query "[0].loginServer" -o tsv)
+                echo "ACR: $ACR_NAME ($ACR_LOGIN)"
+                echo "##vso[task.setvariable variable=acrName;isOutput=true]$ACR_NAME"
+                echo "##vso[task.setvariable variable=acrLogin;isOutput=true]$ACR_LOGIN"
+
+          # --- Docker Build (multi-stage) ---
+          - task: Docker@2
+            displayName: 'Docker Build (multi-stage, non-root)'
+            inputs:
+              command: 'build'
+              Dockerfile: 'Dockerfile'
+              buildContext: '.'
+              tags: |
+                $(imageName):$(imageTag)
+                $(imageName):latest
+
+          # --- Trivy CVE Scan (gate: fail on CRITICAL) ---
+          - script: |
+              chmod +x scripts/scan-trivy.sh
+              ./scripts/scan-trivy.sh "$(imageName):$(imageTag)" "$(Build.ArtifactStagingDirectory)/reports"
+            displayName: 'Trivy — CVE Scan (CRITICAL = pipeline fail)'
+
+          # --- SBOM Generation ---
+          - script: |
+              chmod +x scripts/generate-sbom.sh
+              ./scripts/generate-sbom.sh "$(imageName):$(imageTag)" "$(Build.ArtifactStagingDirectory)/reports"
+            displayName: 'Trivy — SBOM Generation (SPDX JSON)'
+
+          # --- Tag + Push to ACR ---
+          - task: AzureCLI@2
+            displayName: 'Push to ACR'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              addSpnToEnvironment: true
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -euo pipefail
+                ACR_NAME="$(GetACR.acrName)"
+                ACR_LOGIN="$(GetACR.acrLogin)"
+
+                echo "=== Authenticating to $ACR_NAME ==="
+                az acr login --name "$ACR_NAME"
+
+                echo "=== Tagging images ==="
+                docker tag "$(imageName):$(imageTag)" "$ACR_LOGIN/$(imageName):$(imageTag)"
+                docker tag "$(imageName):latest" "$ACR_LOGIN/$(imageName):latest"
+
+                echo "=== Pushing ==="
+                docker push "$ACR_LOGIN/$(imageName):$(imageTag)"
+                docker push "$ACR_LOGIN/$(imageName):latest"
+                echo "=== Push complete ==="
+
+          # --- Verify image landed in ACR ---
+          - task: AzureCLI@2
+            displayName: 'Verify — ACR Repository'
+            inputs:
+              azureSubscription: '$(serviceConnection)'
+              scriptType: 'bash'
+              addSpnToEnvironment: true
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                set -euo pipefail
+                ACR_NAME="$(GetACR.acrName)"
+
+                echo "=== Tags in repository ==="
+                az acr repository show-tags --name "$ACR_NAME" --repository "$(imageName)" --output table
+
+                echo "=== Manifest metadata ==="
+                az acr manifest list-metadata --registry "$ACR_NAME" --name "$(imageName)" --output table
+
+                echo "=== Local image size ==="
+                docker images "$(imageName):$(imageTag)" --format "table {{.Repository}}\t{{.Tag}}\t{{.Size}}"
+
+          # --- Publish scan reports + SBOM as pipeline artifacts ---
+          - task: PublishPipelineArtifact@1
+            displayName: 'Publish — Security Reports + SBOM'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)/reports'
+              artifact: 'security-reports'
+              publishLocation: 'pipeline'

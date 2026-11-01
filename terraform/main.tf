@@ -15,6 +15,11 @@ provider "azurerm" {
 }
 
 # -----------------------------------------------------------------------------
+# Current identity — used to grant AcrPush to the pipeline service connection
+# -----------------------------------------------------------------------------
+data "azurerm_client_config" "current" {}
+
+# -----------------------------------------------------------------------------
 # Local values — cost tags applied to EVERY resource
 # -----------------------------------------------------------------------------
 locals {
@@ -51,4 +56,13 @@ resource "azurerm_container_registry" "main" {
   sku                 = var.acr_sku
   admin_enabled       = false
   tags                = local.default_tags
+}
+
+# -----------------------------------------------------------------------------
+# Grant AcrPush to pipeline identity — so az acr login + docker push works
+# -----------------------------------------------------------------------------
+resource "azurerm_role_assignment" "acr_push" {
+  scope                = azurerm_container_registry.main.id
+  role_definition_name = "AcrPush"
+  principal_id         = data.azurerm_client_config.current.object_id
 }

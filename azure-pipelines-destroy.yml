@@ -1,0 +1,50 @@
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  - group: atlas-02-vars
+
+stages:
+  - stage: Destroy
+    displayName: 'Destroy — Remove ACR + RG'
+    jobs:
+      - deployment: DestroyInfra
+        displayName: 'Terraform Destroy'
+        environment: 'atlas-02-destroy'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'Terraform Init + Destroy'
+                  inputs:
+                    azureSubscription: '$(serviceConnection)'
+                    scriptType: 'bash'
+                    addSpnToEnvironment: true
+                    workingDirectory: 'terraform'
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_USE_OIDC=true
+                      export ARM_CLIENT_ID=$servicePrincipalId
+                      export ARM_TENANT_ID=$tenantId
+                      export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+                      terraform init \
+                        -backend-config="resource_group_name=$(backendResourceGroup)" \
+                        -backend-config="storage_account_name=$(backendStorageAccount)" \
+                        -backend-config="container_name=$(backendContainer)" \
+                        -backend-config="key=$(backendKey)"
+
+                      terraform destroy \
+                        -var-file="environments/dev.tfvars" \
+                        -auto-approve
+
+                      echo "=== Verifying cleanup ==="
+                      az group show --name rg-atlas-02-dev 2>/dev/null \
+                        && echo "##[warning]RG still exists — check manually" \
+                        || echo "=== RG confirmed deleted ==="
