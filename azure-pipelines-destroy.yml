@@ -8,10 +8,10 @@ variables:
 
 stages:
   - stage: Destroy
-    displayName: 'Destroy — Remove ACR + RG'
+    displayName: 'Destroy — ACR + RG + Backend RG'
     jobs:
-      - deployment: DestroyInfra
-        displayName: 'Terraform Destroy'
+      - deployment: DestroyAll
+        displayName: 'Terraform Destroy + Backend Teardown'
         environment: 'atlas-02-destroy'
         strategy:
           runOnce:
@@ -19,8 +19,9 @@ stages:
               steps:
                 - checkout: self
 
+                # --- Step 1: Terraform destroy (needs state, so runs BEFORE backend deletion) ---
                 - task: AzureCLI@2
-                  displayName: 'Terraform Init + Destroy'
+                  displayName: 'Terraform Destroy'
                   inputs:
                     azureSubscription: '$(serviceConnection)'
                     scriptType: 'bash'
@@ -34,17 +35,47 @@ stages:
                       export ARM_TENANT_ID=$tenantId
                       export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
-                      terraform init \
-                        -backend-config="resource_group_name=$(backendResourceGroup)" \
-                        -backend-config="storage_account_name=$(backendStorageAccount)" \
-                        -backend-config="container_name=$(backendContainer)" \
-                        -backend-config="key=$(backendKey)"
+                      if [ "$(az group exists --name $(backendResourceGroup))" = "true" ]; then
+                        terraform init \
+                          -backend-config="resource_group_name=$(backendResourceGroup)" \
+                          -backend-config="storage_account_name=$(backendStorageAccount)" \
+                          -backend-config="container_name=$(backendContainer)" \
+                          -backend-config="key=$(backendKey)"
 
-                      terraform destroy \
-                        -var-file="environments/dev.tfvars" \
-                        -auto-approve
+                        terraform destroy \
+                          -var-file="environments/dev.tfvars" \
+                          -auto-approve
+                      else
+                        echo "##[warning]Backend RG missing — state lost. Falling back to direct RG delete."
+                      fi
 
-                      echo "=== Verifying cleanup ==="
-                      az group show --name rg-atlas-02-dev 2>/dev/null \
-                        && echo "##[warning]RG still exists — check manually" \
-                        || echo "=== RG confirmed deleted ==="
+                      # Safety net: if project RG still exists (state missing or destroy partial), delete it directly
+                      if [ "$(az group exists --name rg-atlas-02-dev)" = "true" ]; then
+                        echo "##[warning]rg-atlas-02-dev still exists — deleting directly"
+                        az group delete --name rg-atlas-02-dev --yes
+                      fi
+                      echo "=== Project RG confirmed deleted ==="
+
+                # --- Step 2: Delete the entire backend RG (state storage included) ---
+                - task: AzureCLI@2
+                  displayName: 'Teardown — Delete backend RG'
+                  inputs:
+                    azureSubscription: '$(serviceConnection)'
+                    scriptType: 'bash'
+                    addSpnToEnvironment: true
+                    scriptLocation: 'inlineScript'
+                    inlineScript: |
+                      set -euo pipefail
+                      if [ "$(az group exists --name $(backendResourceGroup))" = "true" ]; then
+                        echo "=== Deleting backend RG: $(backendResourceGroup) ==="
+                        az group delete --name "$(backendResourceGroup)" --yes
+                      fi
+
+                      echo "=== Final verification ==="
+                      for RG in rg-atlas-02-dev "$(backendResourceGroup)"; do
+                        if [ "$(az group exists --name $RG)" = "true" ]; then
+                          echo "##[error]$RG still exists"; exit 1
+                        fi
+                        echo "$RG — deleted"
+                      done
+                      echo "=== Zero Azure cost. Next deploy re-bootstraps everything. ==="
