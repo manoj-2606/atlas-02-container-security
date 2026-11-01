@@ -1,7 +1,4 @@
-trigger:
-  branches:
-    include:
-      - main
+trigger: none
 
 pool:
   vmImage: 'ubuntu-latest'
@@ -55,11 +52,12 @@ stages:
               steps:
                 - checkout: self
                 - script: |
-                    curl -fsSL https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip -o tf.zip
-                    unzip tf.zip && sudo mv terraform /usr/local/bin/
+                    curl -sLo terraform.zip \
+                      https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip
+                    unzip -o terraform.zip -d /usr/local/bin
                     terraform version
-                  displayName: 'Install Terraform'
-                  
+                  displayName: "Install Terraform $(terraformVersion)"
+
                 - task: AzureCLI@2
                   displayName: 'Terraform Init'
                   inputs:
