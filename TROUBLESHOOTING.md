@@ -1,136 +1,138 @@
 # Troubleshooting — atlas-02-container-security
 
-## 1. Docker Build Fails — "COPY requirements.txt: file not found"
+Sections 1–7 are real incidents from the first pipeline runs. Sections 8+ are known failure modes of this design.
 
-**Cause:** `requirements.txt` is not at the repo root, or `.dockerignore` is excluding it.
+---
 
-**Fix:**
-```bash
-# Verify file exists at root (not inside app/)
-ls -la requirements.txt
+## 1. `terraform: command not found`
 
-# Check .dockerignore doesn't exclude it
-grep "requirements" .dockerignore
-```
+- **Cause:** Microsoft-hosted agents do not ship Terraform.
+- **Fix:** install a pinned version before `terraform init`:
+  ```bash
+  curl -sLo tf.zip https://releases.hashicorp.com/terraform/1.9.8/terraform_1.9.8_linux_amd64.zip
+  sudo unzip -o tf.zip -d /usr/local/bin
+  terraform version
+  ```
+- **Prevent:** every pipeline installs its tools explicitly.
 
-## 2. Trivy Scan Fails — "unable to initialize a scanner"
+## 2. `$(terraformVersion): command not found`
 
-**Cause:** Trivy can't find the local Docker image (name/tag mismatch).
+- **Cause:** the script referenced a variable that does not exist in `atlas-02-vars`. Azure DevOps leaves unresolved macros as literal text, so bash tried to run it as a command.
+- **Fix:** hardcode `1.9.8` in the YAML.
+- **Prevent:** only reference variables you have defined. Pin tool versions in YAML so they are reviewed in Git.
 
-**Fix:**
-```bash
-# List local images
-docker images | grep atlas-platform-app
+## 3. `Error building ARM Config: Authenticating using Azure CLI is only supported as a User`
 
-# Ensure the image name matches what scan-trivy.sh expects
-# Usage: ./scripts/scan-trivy.sh "atlas-platform-app:"
-```
+- **Cause:** `ARM_OIDC_TOKEN` was not exported, so the provider fell back to Azure CLI auth, which does not work for a service principal.
+- **Fix:** export all five variables in **every** step that runs Terraform (init and plan/apply):
+  ```bash
+  export ARM_USE_OIDC=true
+  export ARM_CLIENT_ID=$servicePrincipalId
+  export ARM_OIDC_TOKEN=$idToken
+  export ARM_TENANT_ID=$tenantId
+  export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+  ```
+  Requires `addSpnToEnvironment: true` on the AzureCLI@2 task.
+- **Prevent:** copy the auth block from a working pipeline (atlas-01).
 
-## 3. Trivy Finds CRITICAL CVEs — Pipeline Blocked
+## 4. PyPI SSL / timeout errors during `docker build`
 
-**This is working as designed.** The pipeline is supposed to fail.
+- **Cause:** unreliable outbound connectivity from the hosted agent to pypi.org.
+- **Fix:** in the Dockerfile:
+  ```dockerfile
+  RUN pip install --no-cache-dir --timeout=120 --retries=10 --prefix=/install -r requirements.txt
+  ```
+  Re-running often lands on a healthier agent.
+- **Prevent:** always set timeout and retries on external downloads in CI.
 
-**Options:**
-1. **Fix it** — update the base image in Dockerfile to a patched version:
-   ```dockerfile
-   FROM python:3.12-slim AS builder
-   # Try a newer slim tag or switch to alpine
-   ```
-2. **Accept it** — if no patch exists and it doesn't apply to your use case, add to `.trivyignore` with justification:
-   ```
-   CVE-2024-XXXXX  # No patch available, not exploitable in our context (no network listener on affected lib)
-   ```
-3. **Never silently skip** — undocumented ignores are a security antipattern.
+## 5. Trivy install failed (GitHub download timeout)
 
-## 4. az acr login Fails — "403 Forbidden"
+- **Cause:** `raw.githubusercontent.com` / GitHub releases unreachable from the agent.
+- **Fix:** try the install script first, fall back to the Trivy apt repository:
+  ```bash
+  sudo apt-get install -y wget gnupg
+  wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+  echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+  sudo apt-get update && sudo apt-get install -y trivy
+  ```
+- **Prevent:** never depend on a single download source for CI tooling.
 
-**Cause:** Pipeline identity doesn't have `AcrPush` role on the ACR.
+## 6. `unable to find image "atlas-platform-app:311" locally`
 
-**Fix:** Verify the role assignment exists in Terraform:
-```hcl
-resource "azurerm_role_assignment" "acr_push" {
-  scope                = azurerm_container_registry.main.id
-  role_definition_name = "AcrPush"
-  principal_id         = data.azurerm_client_config.current.object_id
-}
-```
+- **Cause:** `Docker@2` with `command: build` but no `repository` input does not apply the `tags` you specified, so the image name Trivy looked for never existed.
+- **Fix:** replace the task with a script:
+  ```yaml
+  - script: |
+      docker build -t $(imageName):$(imageTag) -t $(imageName):latest .
+    displayName: 'Docker build'
+  ```
+- **Prevent:** plain `docker build` is explicit, with no hidden task behavior.
 
-If Terraform already applied but push still fails, Azure role propagation can take 1-2 minutes. Re-run the pipeline.
+## 7. YAML error: stray `inputs:` under a `script:` step
 
-**Manual check:**
-```bash
-# Get the service principal's object ID
-az ad sp show --id  --query id -o tsv
+- **Cause:** converted a `task:` to `script:` and left the old `inputs:` block behind.
+- **Fix:** delete the orphaned block.
+- **Prevent:** when replacing a task, remove the whole task including `inputs:`.
 
-# Check role assignments on ACR
-az role assignment list --scope  --output table
-```
+---
 
-## 5. docker push Fails — "unauthorized: authentication required"
+## 8. Trivy finds CRITICAL CVEs — pipeline blocked
 
-**Cause:** `az acr login` token expired (valid for ~3 hours) or wasn't called before push.
+**This is the gate working.** Options:
+1. Fix: update the base image tag (`python:3.12-slim` rebuilds regularly) or the vulnerable package pin.
+2. Accept (only if no patch exists and it is not exploitable here): add to `.trivyignore` **with a justification comment**.
+3. Never ignore silently.
 
-**Fix:** Ensure `az acr login --name ` runs in the same pipeline step as `docker push`. Splitting across steps can lose the Docker auth context.
+## 9. `az acr login` or `docker push` returns 403 / unauthorized
 
-## 6. ACR Name Conflict — "already exists"
+- **Cause:** pipeline identity lacks `AcrPush`, or role propagation has not finished.
+- **Fix:** confirm `azurerm_role_assignment.acr_push` applied; wait 1–2 minutes and re-run. Run `az acr login` and `docker push` in the **same** step so Docker auth is not lost.
+- **Check:**
+  ```bash
+  az role assignment list --scope <acr-resource-id> --output table
+  ```
 
-**Cause:** ACR names are globally unique across all Azure tenants. `acratlas02dev` might be taken.
+## 10. ACR name already taken
 
-**Fix:** Change the naming in `terraform/main.tf`:
-```hcl
-locals {
+- **Cause:** ACR names are globally unique. Change the suffix in `terraform/main.tf`:
+  ```hcl
   acr_name = "acr${replace(var.project_name, "-", "")}${var.environment}2606"
-}
-```
-Append your unique suffix (e.g., last 4 digits of your phone number).
+  ```
 
-## 7. Image Size > 100MB
+## 11. Image larger than 100MB
 
-**Cause:** Multi-stage build not working correctly, or unnecessary files copied in.
-
-**Debug:**
 ```bash
-# Check layer sizes
-docker history atlas-platform-app:
-
-# Check what's in the image
-docker run --rm -it atlas-platform-app: ls -la /app/
-docker run --rm -it atlas-platform-app: pip list
+docker history atlas-platform-app:<tag>
+docker run --rm atlas-platform-app:<tag> pip list
 ```
+Common causes: `COPY . .` instead of `COPY app/ ./app/`, missing `.dockerignore`, missing `--no-cache-dir`.
 
-**Common culprits:**
-- `.dockerignore` missing → `.git/` copied into image
-- `COPY . .` instead of `COPY app/ ./app/` → terraform files in image
-- `--no-cache-dir` missing from pip install → pip cache inflates size
+## 12. `$(GetACR.acrName)` is empty
 
-## 8. SBOM Generation Fails — "no packages found"
+- **Cause:** output variables need `name:` on the step (not just `displayName`) and `isOutput=true` in the `setvariable` command.
+- **Fix:** verify both are present on the `GetACR` step.
 
-**Cause:** Trivy can't read the image filesystem.
+## 13. Docs screenshot missing from GitHub
 
-**Fix:**
-```bash
-# Verify image exists locally
-docker images | grep atlas-platform-app
+- **Cause:** `.gitignore` pattern `trivy-report.*` also matches `docs/trivy-report.png`.
+- **Fix:** ignore only `trivy-report.txt` and `trivy-report.json`; then `git add docs/` and confirm with `git status`.
 
-# Run SBOM manually to see full error
-trivy image --format spdx-json atlas-platform-app:
-```
+## 14. Destroy pipeline: cannot delete backend RG (403)
 
-## 9. Pipeline Variable $(GetACR.acrName) Is Empty
+- **Cause:** `MI-ADO-API` lacks Contributor at subscription scope.
+- **Fix:** grant Contributor (or a role with `Microsoft.Resources/subscriptions/resourceGroups/delete`) and re-run.
 
-**Cause:** The `GetACR` step's output variable didn't propagate. Usually means the step name doesn't match.
+## 15. Destroy pipeline: backend RG already gone
 
-**Fix:** Verify the step has `name: GetACR` (not just `displayName`). In ADO, `$(stepName.variableName)` requires the `name` property on the task, not `displayName`.
+- **Behaviour:** the pipeline detects this, skips Terraform (state is lost), and deletes `rg-atlas-02-dev` directly. If resources linger, delete the RG manually.
 
-## 10. Terraform State Lock — "Error acquiring the state lock"
+---
 
-**Same fix as P1:**
-```bash
-# Find the lock
-az storage blob lease break \
-  --blob-name atlas-02.tfstate \
-  --container-name tfstate \
-  --account-name atlastfstate2606
+## New-pipeline checklist
 
-# Then re-run the pipeline
-```
+- Copy the auth block from a working pipeline
+- Install every tool explicitly (Terraform, Trivy), pinned versions in YAML
+- `--timeout` and `--retries` on every external download
+- Fallback install path for CI tools
+- Plain `docker build -t` rather than `Docker@2`
+- Run `terraform fmt` and pre-commit before pushing
