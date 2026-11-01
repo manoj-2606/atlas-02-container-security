@@ -1,0 +1,8 @@
+# Trivy CVE Ignore List
+# Format: CVE-ID  # justification
+# Only add CVEs after manual review. Document WHY each is accepted.
+#
+# Example:
+# CVE-2024-12345  # Low severity, no exploit available, fixed in next base image update
+#
+# Current: empty — no accepted CVEs. Zero-tolerance baseline.

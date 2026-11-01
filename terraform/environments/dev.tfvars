@@ -1,0 +1,6 @@
+project_name = "atlas-02"
+environment  = "dev"
+location     = "centralindia"
+acr_sku      = "Basic"
+cost_center  = "atlas-platform"
+created_by   = "terraform"

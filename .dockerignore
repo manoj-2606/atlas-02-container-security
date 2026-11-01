@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+
+# Terraform — not needed in container
+terraform/
+*.tf
+*.tfvars
+*.tfstate
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Docs and configs — not needed in container
+docs/
+*.md
+.pre-commit-config.yaml
+.trivyignore
+scripts/
+
+# CI/CD
+azure-pipelines*.yml
+.github/
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
